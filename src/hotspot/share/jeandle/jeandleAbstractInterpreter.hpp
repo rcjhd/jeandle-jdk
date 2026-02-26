@@ -144,12 +144,17 @@ class JeandleBasicBlock : public JeandleCompilationResourceObj {
   // Update the JeandleVMState according to the predecessor block's stack values and locals.
   bool merge_VM_state_from(JeandleVMState* vm_state, llvm::BasicBlock* incoming, ciMethod* method);
 
+  // Clone necessary metadata from original block
+  void clone_metadata_from(JeandleBasicBlock* block);
+
   enum Flag {
     no_flag                       = 0,
     is_compiled                   = 1 << 0,
     is_on_work_list               = 1 << 1,
     is_loop_header                = 1 << 2,
     always_uncommon_trap          = 1 << 3,
+    is_jsr_subroutine_entry       = 1 << 4,
+    is_jsr_subroutine_ret         = 1 << 5,
   };
 
   void set(Flag f)                               { _flags |= f; }
@@ -184,8 +189,8 @@ class JeandleBasicBlock : public JeandleCompilationResourceObj {
   void set_tail_llvm_block(llvm::BasicBlock* block) { _tail_llvm_block = block; }
 
   bool is_exception_handler() { return _ci_block->is_handler(); }
-  int exeption_range_start_bci() { return _ci_block->ex_start_bci(); }
-  int exeption_range_limit_bci() { return _ci_block->ex_limit_bci(); }
+  int exception_range_start_bci() { return _ci_block->ex_start_bci(); }
+  int exception_range_limit_bci() { return _ci_block->ex_limit_bci(); }
 
  private:
   int _block_id;
@@ -212,6 +217,52 @@ class JeandleBasicBlock : public JeandleCompilationResourceObj {
   void initialize_VM_state_from(JeandleVMState* incoming_state, llvm::BasicBlock* incoming_block, MethodLivenessResult liveness);
 };
 
+// A scope to record jsr/ret continuation, which implement a pseudo-inline
+// like C1. C2 uses JfrSet in ciTypeFlow, better but complexed.
+// With that we can convert dynamic jsr/ret to a static goto regardless of
+// ret's index, it can handle simple jsr/ret constructs but not arbitrary
+// jsr/ret(is it exist?).
+// reference to ScopeData in c1_GraphBuilder.hpp
+class JsrScopeData: public JeandleCompilationResourceObj {
+ private:
+  JsrScopeData*  _parent;
+
+  // We track the destination bci of the jsr only to determine
+  // bailout conditions, since we only handle a subset of all of the
+  // possible jsr-ret control structures. Recursive invocations of a
+  // jsr are disallowed by the verifier.
+  int          _jsr_entry_bci;
+  // We need to track the local variable in which the return address
+  // was stored to ensure we can handle inlining the jsr, because we
+  // don't handle arbitrary jsr/ret constructs.
+  int          _jsr_ret_addr_local;
+  // The continuation point for rets
+  JeandleBasicBlock*  _jsr_continuation;
+  // Clone of bci2block to track cloned blocks for this JSR scope
+  llvm::SmallVector<JeandleBasicBlock*> _bci2block;
+  // Map original blocks to their clones in this JSR scope
+  llvm::DenseMap<JeandleBasicBlock*, JeandleBasicBlock*> _original_to_clone;
+
+ public:
+  JsrScopeData(JsrScopeData* parent, const llvm::SmallVector<JeandleBasicBlock*>& parent_bci2block);
+
+  JsrScopeData* parent() const                          { return _parent;            }
+
+  int  jsr_entry_bci() const                            { return _jsr_entry_bci;     }
+  void set_jsr_entry_bci(int bci)                       { _jsr_entry_bci = bci;      }
+  void set_jsr_return_address_local(int local_no)       { _jsr_ret_addr_local = local_no; }
+  int  jsr_return_address_local() const                 { return _jsr_ret_addr_local; }
+
+  // The jsr continuation is only used when parsing_jsr is true, and
+  // is different from the "normal" continuation since we can end up
+  // doing a return (rather than a ret) from within a subroutine
+  JeandleBasicBlock* jsr_continuation() const           { return _jsr_continuation;  }
+  void set_jsr_continuation(JeandleBasicBlock* cont)    { _jsr_continuation = cont;  }
+
+  llvm::SmallVector<JeandleBasicBlock*>& bci2block()    { return _bci2block;         }
+  llvm::DenseMap<JeandleBasicBlock*, JeandleBasicBlock*>& original_to_clone() { return _original_to_clone; }
+};
+
 class BasicBlockBuilder : public JeandleCompilationResourceObj {
  public:
   BasicBlockBuilder(ciMethod* method, llvm::LLVMContext* context, llvm::Function* llvm_func);
@@ -220,6 +271,8 @@ class BasicBlockBuilder : public JeandleCompilationResourceObj {
 
   JeandleBasicBlock* entry_block() { return _entry_block; }
 
+  JeandleBasicBlock* clone(JeandleBasicBlock* block, JsrScopeData* jsr_scope_data);
+  bool should_clone_for_jsr(JeandleBasicBlock* block, JsrScopeData* jsr_scope_data);
   static void connect_block(JeandleBasicBlock* child_block, JeandleBasicBlock* parent_block) {
     assert(child_block != nullptr && parent_block != nullptr, "connecting nullptr");
     child_block->add_predecessor(parent_block);
@@ -235,6 +288,7 @@ class BasicBlockBuilder : public JeandleCompilationResourceObj {
   llvm::LLVMContext* _context;
   llvm::Function* _llvm_func;
   JeandleBasicBlock* _entry_block; // a dummy block holding initial stack/locals state.
+  int _num_blocks;
 
   // For loop marking and ordering.
   ResourceBitMap _active;
@@ -244,7 +298,8 @@ class BasicBlockBuilder : public JeandleCompilationResourceObj {
   void generate_blocks();
   void setup_exception_handlers();
   void setup_control_flow();
-  JeandleBasicBlock* make_block_at(int bci, JeandleBasicBlock* current);
+
+  void handle_jsr(JeandleBasicBlock* current, int sr_bci, int next_bci);
 
   void mark_loops();
   void mark_loops(JeandleBasicBlock* block);
@@ -268,6 +323,8 @@ class JeandleAbstractInterpreter : public StackObj {
   JeandleCompiledCode& _compiled_code;
   BasicBlockBuilder* _block_builder;
   llvm::IRBuilder<> _ir_builder;
+  // The JsrScopeData to handle jsr/ret instructions
+  JsrScopeData*        _jsr_scope_data;
 
   // Record oop values.
   llvm::DenseMap<jobject, llvm::Value*> _oops;
@@ -282,6 +339,8 @@ class JeandleAbstractInterpreter : public StackObj {
   // Object & Lock for synchronized method
   LockValue _sync_lock;
 
+  // Normally return bci2block()[bci], clone the block while parsing_jsr
+  JeandleBasicBlock* block_at(int bci);
   void initialize_VM_state();
   void interpret();
   void interpret_block(JeandleBasicBlock* block);
@@ -298,6 +357,8 @@ class JeandleAbstractInterpreter : public StackObj {
   void fcmp(BasicType type, bool true_if_unordered);
   void lcmp();
   void goto_bci(int bci);
+  void jsr(int bci);
+  void ret(int index, JeandleBasicBlock* current);
   void lookup_switch();
   void table_switch();
   void invoke();
@@ -319,6 +380,9 @@ class JeandleAbstractInterpreter : public StackObj {
                                    llvm::CallingConv::ID calling_conv);
 
   void add_safepoint_poll();
+  void push_scope_for_jsr(JeandleBasicBlock* jsr_continuation, int jsr_dest_bci);
+  void pop_scope_for_jsr();
+  bool parsing_jsr() const                           { return _jsr_scope_data != nullptr;  }
 
   llvm::SmallVector<JeandleBasicBlock*>& bci2block() { return _block_builder->bci2block(); }
 
@@ -349,6 +413,8 @@ class JeandleAbstractInterpreter : public StackObj {
   void do_put_xxx(ciField* field, bool is_static);
 
   void arraylength();
+
+  void do_astore(int index);
 
   // Implementation of array *aload and *astore bytecodes.
   void do_array_load(BasicType basic_type);

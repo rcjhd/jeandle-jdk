@@ -1,0 +1,136 @@
+/*
+ * Copyright (c) 2026, the Jeandle-JDK Authors. All Rights Reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ */
+
+package compiler/jeandle/bytecodeTranslate;
+
+super public class JsrExecution
+{
+    public static Method testWithJSR:"()I"
+        stack 1 locals 2
+    {
+        // init result = 1     
+        iconst_1;
+        istore_0;
+        
+        // jump to subroutine
+        jsr SUBROUTINE;
+
+        iload_0;
+        // expect return 2
+        ireturn;
+
+    SUBROUTINE:
+        astore_1;
+        
+        // set result = 2
+        iconst_2;
+        istore_0;
+        
+        ret 1;
+    }
+
+    public static Method testWithNestedJSR:"()I"
+        stack 1 locals 3
+    {
+        // init result = 1
+        iconst_1;
+        istore_0;
+        
+        jsr SUB1;
+
+        iload_0;
+        // expect return 3
+        ireturn;
+
+    SUB1:
+        astore_1;
+        
+        iinc 0, 1;  // result++ (1 -> 2)
+        
+        jsr SUB2;
+        
+        ret 1;
+
+    SUB2:
+        astore_2;
+        
+        iinc 0, 1;  // result++ (2 -> 3)
+        
+        ret 2;
+    }
+
+    public static Method testWithSharedJSR:"()I"
+        stack 1 locals 2
+    {
+        // init result = 1
+        iconst_1;
+        istore_0;
+        
+        jsr SUBROUTINE;
+
+        jsr SUBROUTINE;
+
+        jsr SUBROUTINE;
+
+        iload_0;
+        // expect return 4
+        ireturn;
+
+    SUBROUTINE:
+        astore_1;
+        
+        iinc 0, 1;  // result++
+        
+        ret 1;
+    }
+
+    public static Method testWithGotoJSR:"()I"
+        stack 1 locals 2
+    {
+        // init result = 1
+        iconst_1;
+        istore_0;
+        
+        jsr SUBROUTINE;
+
+        jsr SUBROUTINE;
+
+        iload_0;
+        // expect return 9
+        ireturn;
+
+    SUBROUTINE:
+        astore_1;
+
+        iinc 0, 1;
+        
+        goto GOTO_2;
+
+    GOTO_1: // Never reach
+        iinc 0, 2;
+        
+        ret 1;
+
+    GOTO_2:
+        iinc 0, 3;
+        
+        ret 1;
+    }
+}
