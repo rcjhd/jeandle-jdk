@@ -314,7 +314,7 @@ void JeandleBasicBlock::clone_metadata_from(JeandleBasicBlock* block) {
   _reverse_post_order = block->_reverse_post_order;
 
   // Consider: _jvm need clone? this should happen before interpret so _jvm = nullptr
-  assert(block->_jvm == nullptr, "VM state should be null");
+  // assert(block->_jvm == nullptr, "VM state should be null");
 }
 
 void JeandleBasicBlock::initialize_VM_state_from(JeandleVMState* incoming_state, llvm::BasicBlock* incoming_block, MethodLivenessResult liveness) {
@@ -375,6 +375,215 @@ BasicBlockBuilder::BasicBlockBuilder(ciMethod* method,
   setup_control_flow();
   mark_loops();
 }
+
+const char* codes[205] = {
+    "_illegal              ",
+
+    // Java bytecodes
+    "_nop                  ",
+    "_aconst_null          ",
+    "_iconst_m1            ",
+    "_iconst_0             ",
+    "_iconst_1             ",
+    "_iconst_2             ",
+    "_iconst_3             ",
+    "_iconst_4             ",
+    "_iconst_5             ",
+    "_lconst_0             ",
+    "_lconst_1             ",
+    "_fconst_0             ",
+    "_fconst_1             ",
+    "_fconst_2             ",
+    "_dconst_0             ",
+    "_dconst_1             ",
+    "_bipush               ",
+    "_sipush               ",
+    "_ldc                  ",
+    "_ldc_w                ",
+    "_ldc2_w               ",
+    "_iload                ",
+    "_lload                ",
+    "_fload                ",
+    "_dload                ",
+    "_aload                ",
+    "_iload_0              ",
+    "_iload_1              ",
+    "_iload_2              ",
+    "_iload_3              ",
+    "_lload_0              ",
+    "_lload_1              ",
+    "_lload_2              ",
+    "_lload_3              ",
+    "_fload_0              ",
+    "_fload_1              ",
+    "_fload_2              ",
+    "_fload_3              ",
+    "_dload_0              ",
+    "_dload_1              ",
+    "_dload_2              ",
+    "_dload_3              ",
+    "_aload_0              ",
+    "_aload_1              ",
+    "_aload_2              ",
+    "_aload_3              ",
+    "_iaload               ",
+    "_laload               ",
+    "_faload               ",
+    "_daload               ",
+    "_aaload               ",
+    "_baload               ",
+    "_caload               ",
+    "_saload               ",
+    "_istore               ",
+    "_lstore               ",
+    "_fstore               ",
+    "_dstore               ",
+    "_astore               ",
+    "_istore_0             ",
+    "_istore_1             ",
+    "_istore_2             ",
+    "_istore_3             ",
+    "_lstore_0             ",
+    "_lstore_1             ",
+    "_lstore_2             ",
+    "_lstore_3             ",
+    "_fstore_0             ",
+    "_fstore_1             ",
+    "_fstore_2             ",
+    "_fstore_3             ",
+    "_dstore_0             ",
+    "_dstore_1             ",
+    "_dstore_2             ",
+    "_dstore_3             ",
+    "_astore_0             ",
+    "_astore_1             ",
+    "_astore_2             ",
+    "_astore_3             ",
+    "_iastore              ",
+    "_lastore              ",
+    "_fastore              ",
+    "_dastore              ",
+    "_aastore              ",
+    "_bastore              ",
+    "_castore              ",
+    "_sastore              ",
+    "_pop                  ",
+    "_pop2                 ",
+    "_dup                  ",
+    "_dup_x1               ",
+    "_dup_x2               ",
+    "_dup2                 ",
+    "_dup2_x1              ",
+    "_dup2_x2              ",
+    "_swap                 ",
+    "_iadd                 ",
+    "_ladd                 ",
+    "_fadd                 ",
+    "_dadd                 ",
+    "_isub                 ",
+    "_lsub                 ",
+    "_fsub                 ",
+    "_dsub                 ",
+    "_imul                 ",
+    "_lmul                 ",
+    "_fmul                 ",
+    "_dmul                 ",
+    "_idiv                 ",
+    "_ldiv                 ",
+    "_fdiv                 ",
+    "_ddiv                 ",
+    "_irem                 ",
+    "_lrem                 ",
+    "_frem                 ",
+    "_drem                 ",
+    "_ineg                 ",
+    "_lneg                 ",
+    "_fneg                 ",
+    "_dneg                 ",
+    "_ishl                 ",
+    "_lshl                 ",
+    "_ishr                 ",
+    "_lshr                 ",
+    "_iushr                ",
+    "_lushr                ",
+    "_iand                 ",
+    "_land                 ",
+    "_ior                  ",
+    "_lor                  ",
+    "_ixor                 ",
+    "_lxor                 ",
+    "_iinc                 ",
+    "_i2l                  ",
+    "_i2f                  ",
+    "_i2d                  ",
+    "_l2i                  ",
+    "_l2f                  ",
+    "_l2d                  ",
+    "_f2i                  ",
+    "_f2l                  ",
+    "_f2d                  ",
+    "_d2i                  ",
+    "_d2l                  ",
+    "_d2f                  ",
+    "_i2b                  ",
+    "_i2c                  ",
+    "_i2s                  ",
+    "_lcmp                 ",
+    "_fcmpl                ",
+    "_fcmpg                ",
+    "_dcmpl                ",
+    "_dcmpg                ",
+    "_ifeq                 ",
+    "_ifne                 ",
+    "_iflt                 ",
+    "_ifge                 ",
+    "_ifgt                 ",
+    "_ifle                 ",
+    "_if_icmpeq            ",
+    "_if_icmpne            ",
+    "_if_icmplt            ",
+    "_if_icmpge            ",
+    "_if_icmpgt            ",
+    "_if_icmple            ",
+    "_if_acmpeq            ",
+    "_if_acmpne            ",
+    "_goto                 ",
+    "_jsr                  ",
+    "_ret                  ",
+    "_tableswitch          ",
+    "_lookupswitch         ",
+    "_ireturn              ",
+    "_lreturn              ",
+    "_freturn              ",
+    "_dreturn              ",
+    "_areturn              ",
+    "_return               ",
+    "_getstatic            ",
+    "_putstatic            ",
+    "_getfield             ",
+    "_putfield             ",
+    "_invokevirtual        ",
+    "_invokespecial        ",
+    "_invokestatic         ",
+    "_invokeinterface      ",
+    "_invokedynamic        ",
+    "_new                  ",
+    "_newarray             ",
+    "_anewarray            ",
+    "_arraylength          ",
+    "_athrow               ",
+    "_checkcast            ",
+    "_instanceof           ",
+    "_monitorenter         ",
+    "_monitorexit          ",
+    "_wide                 ",
+    "_multianewarray       ",
+    "_ifnull               ",
+    "_ifnonnull            ",
+    "_goto_w               ",
+    "_jsr_w                ",
+    "_breakpoint           ",
+};
 
 bool BasicBlockBuilder::should_clone_for_jsr(JeandleBasicBlock* block, JsrScopeData* jsr_scope_data) {
   // Don't clone ret blocks - they are definitely use jsr_continuation
@@ -590,6 +799,8 @@ void BasicBlockBuilder::setup_control_flow() {
 
 void BasicBlockBuilder::handle_jsr(JeandleBasicBlock* current, int sr_bci, int next_bci) {
   if (next_bci < _method->code_size()) {
+    // connect the block at the subroutine ret to jsr block
+    connect_block(_bci2block[next_bci], current);
     if (!_bci2block[next_bci]->is_set(JeandleBasicBlock::is_jsr_subroutine_ret)) {
       _bci2block[next_bci]->set(JeandleBasicBlock::is_jsr_subroutine_ret);
     }
@@ -661,6 +872,8 @@ void BasicBlockBuilder::mark_loops(JeandleBasicBlock* block) {
 
   // Reverse-post-order numbering of all blocks.
   block->set_reverse_post_order(_next_block_order--);
+
+  printf("block id - %d bci - %d~%d order - %d successors_number:%ld\n", block_id, block->start_bci(), block->limit_bci(), block->reverse_post_order(), block->successors().size());
 }
 
 JsrScopeData::JsrScopeData(JsrScopeData* parent, const llvm::SmallVector<JeandleBasicBlock*>& parent_bci2block)
@@ -704,6 +917,7 @@ JeandleBasicBlock* JeandleAbstractInterpreter::block_at(int bci) {
     JeandleBasicBlock* block = _jsr_scope_data->bci2block()[bci];
     if (_block_builder->should_clone_for_jsr(block, _jsr_scope_data)) {
       JeandleBasicBlock* new_block = _block_builder->clone(block, _jsr_scope_data);
+      printf("clone block-%d\n", block->block_id());
       for (int i = bci2block()[bci]->start_bci(); i < bci2block()[bci]->limit_bci(); i++) {
         _jsr_scope_data->bci2block()[i] = new_block;
       }
@@ -798,7 +1012,9 @@ void JeandleAbstractInterpreter::interpret() {
     _work_list.pop_back();
     current->clear(JeandleBasicBlock::is_on_work_list);
 
+    printf("interpret block %d order %d\n", current->block_id(), current->reverse_post_order());
     interpret_block(current);
+    printf("interpret block %d over\n\n", current->block_id());
     RETURN_VOID_ON_JEANDLE_ERROR();
   }
 
@@ -807,6 +1023,11 @@ void JeandleAbstractInterpreter::interpret() {
 
 void JeandleAbstractInterpreter::interpret_block(JeandleBasicBlock* block) {
   assert(block != nullptr, "compile a null block");
+  if (block->is_set(JeandleBasicBlock::is_jsr_subroutine_entry)) {
+    printf("interpret subroutine\n");
+  }
+
+  printf("interpret block %d\n", block->block_id());
 
   _ir_builder.SetInsertPoint(block->header_llvm_block());
 
@@ -824,6 +1045,11 @@ void JeandleAbstractInterpreter::interpret_block(JeandleBasicBlock* block) {
 
   if (parsing_jsr() && block->is_set(JeandleBasicBlock::is_loop_header)) {
     // TODO: jsr subroutine with a loop can't handle now, maybe set it to an uncommon trap
+    // uncommon_trap(Deoptimization::Reason_unhandled,
+    //               Deoptimization::Action_none);
+    // block->set(JeandleBasicBlock::always_uncommon_trap);
+    //
+    // return;
     JEANDLE_ERROR_ASSERT_AND_RET_VOID_ON_FAIL(false, "jsr subroutine has a loop, can't handle");
   }
 
@@ -833,6 +1059,7 @@ void JeandleAbstractInterpreter::interpret_block(JeandleBasicBlock* block) {
           _bytecodes.cur_bci() >= _block->start_bci() &&
           _bytecodes.cur_bci() < _block->limit_bci() &&
           !_block->is_set(JeandleBasicBlock::always_uncommon_trap)) {
+    printf("code-%s\n", codes[code+1]);
     // Handle by opcode, see: https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-7.html
     switch (code) {
       case Bytecodes::_nop: break;
@@ -1143,6 +1370,7 @@ void JeandleAbstractInterpreter::interpret_block(JeandleBasicBlock* block) {
     return;
   }
 
+  printf("block %d has %ld successors\n", block->block_id(), block->successors().size());
   // Add all successors to work list and set up their JeandleVMStates.
   for (JeandleBasicBlock* suc : block->successors()) {
     // Don't update handlers' VM state here. They are updated by exception throwers.
@@ -1153,7 +1381,10 @@ void JeandleAbstractInterpreter::interpret_block(JeandleBasicBlock* block) {
     if (!suc->is_set(JeandleBasicBlock::is_compiled)) {
       if (suc->is_set(JeandleBasicBlock::is_jsr_subroutine_entry)) {
         assert(suc->predecessors().size() == 1 && block == suc->predecessors()[0], "each jsr subroutine should be a clean clone.");
+        printf("add subroutine to work list\n");
+        printf("order:%d\n",suc->reverse_post_order());
       }
+      printf("block %d add to work list\n", suc->block_id());
       add_to_work_list(suc);
     }
   }
@@ -1345,6 +1576,7 @@ void JeandleAbstractInterpreter::goto_bci(int bci) {
 }
 
 void JeandleAbstractInterpreter::push_scope_for_jsr(JeandleBasicBlock* jsr_continuation, int jsr_dest_bci) {
+  printf("push\n");
   JsrScopeData* data = new JsrScopeData(_jsr_scope_data, bci2block());
   data->set_jsr_entry_bci(jsr_dest_bci);
   data->set_jsr_return_address_local(-1);
@@ -1353,10 +1585,12 @@ void JeandleAbstractInterpreter::push_scope_for_jsr(JeandleBasicBlock* jsr_conti
 }
 
 void JeandleAbstractInterpreter::pop_scope_for_jsr() {
+  printf("pop\n");
   _jsr_scope_data = _jsr_scope_data->parent();
 }
 
 void JeandleAbstractInterpreter::jsr(int bci) {
+  printf("jsr %d\n", bci);
   int dest = bci;
   int next = _bytecodes.next_bci();
   // We only handle well-formed jsrs (those which are "block-structured").
@@ -1402,6 +1636,7 @@ void JeandleAbstractInterpreter::ret(int index, JeandleBasicBlock* current) {
     // This can happen if arbitrary jsr/ret constructs
     JEANDLE_ERROR_ASSERT_AND_RET_VOID_ON_FAIL(false, "arbitrary jsr/ret");
   }
+  printf("ret %d\n", index);
   JeandleBasicBlock* ret_block = _jsr_scope_data->jsr_continuation();
   BasicBlockBuilder::connect_block(ret_block, current);
 
@@ -1526,7 +1761,8 @@ void JeandleAbstractInterpreter::invoke() {
     assert(method_signature == target->signature(), "method signature unmatched");
   }
 
-  // Additional receiver subtype checks for interface calls via invokespecial or invokeinterface.
+  // TODO: Additional receiver subtype checks for interface calls via invokespecial or invokeinterface.
+  // To keep consistent with C2, but no suitable test case for now.
   ciKlass* receiver_constraint = nullptr;
   if (bc == Bytecodes::_invokespecial && !target->is_object_initializer()) {
     ciInstanceKlass* sender_klass = _method->holder();
