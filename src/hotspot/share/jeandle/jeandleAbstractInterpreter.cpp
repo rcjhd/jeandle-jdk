@@ -78,37 +78,50 @@ JeandleVMState* JeandleVMState::copy_for_exception_handler(llvm::Value* exceptio
 // Like C1's ValueStack::is_same.
 bool JeandleVMState::match(JeandleVMState* to_match) {
   if (_locals.size() != to_match->_locals.size()) {
+    log_error(jeandle)("VM state mismatch: locals size " SIZE_FORMAT " != " SIZE_FORMAT,
+                       _locals.size(), to_match->_locals.size());
     return false;
   }
 
   if (_stack.size() != to_match->_stack.size()) {
+    log_error(jeandle)("VM state mismatch: stack size " SIZE_FORMAT " != " SIZE_FORMAT,
+                       _stack.size(), to_match->_stack.size());
     return false;
   }
 
   for (size_t i = 0; i < _stack.size(); i++) {
     if (_stack[i].is_null()) {
       if (!to_match->_stack[i].is_null()) {
+        log_error(jeandle)("VM state mismatch: stack[" SIZE_FORMAT "] is null, incoming is %s",
+                           i, type2name(to_match->_stack[i].actual_type()));
         return false;
       }
       continue;
     }
 
     if (to_match->_stack[i].is_null()) {
+      log_error(jeandle)("VM state mismatch: stack[" SIZE_FORMAT "] is %s, incoming is null",
+                         i, type2name(_stack[i].actual_type()));
       return false;
     }
 
     // For call instructions, getType() returns the return type.
     if (_stack[i].value()->getType() != to_match->_stack[i].value()->getType()) {
+      log_error(jeandle)("VM state mismatch: stack[" SIZE_FORMAT "] type differs: %s != %s",
+                         i, type2name(_stack[i].actual_type()), type2name(to_match->_stack[i].actual_type()));
       return false;
     }
   }
 
   if (_locks.size() != to_match->_locks.size()) {
+    log_error(jeandle)("VM state mismatch: locks size " SIZE_FORMAT " != " SIZE_FORMAT,
+                       _locks.size(), to_match->_locks.size());
     return false;
   }
 
   for (size_t i = 0; i < _locks.size(); i++) {
     if (!_locks[i].equals(to_match->_locks[i])) {
+      log_error(jeandle)("VM state mismatch: lock[" SIZE_FORMAT "] differs", i);
       return false;
     }
   }
@@ -148,7 +161,14 @@ bool JeandleVMState::update_phi_nodes(JeandleVMState* income_jvm, llvm::BasicBlo
     llvm::PHINode* phi_node = llvm::cast<llvm::PHINode>(_locals[i].value());
 
     if (income_locals[i].is_null() || phi_node->getType() != income_locals[i].value()->getType()) {
-      assert(phi_node->use_empty(), "cannot use invalid local variable");
+      log_trace(jeandle)("VM state mismatch: local[" SIZE_FORMAT "] phi is %s, incoming is %s, use_empty=%s",
+                         i,
+                         type2name(_locals[i].actual_type()),
+                         income_locals[i].is_null() ? "null" : type2name(income_locals[i].actual_type()),
+                         phi_node->use_empty() ? "true" : "false");
+      if (!phi_node->use_empty()) {
+        phi_node->replaceAllUsesWith(llvm::Constant::getNullValue(phi_node->getType()));
+      }
       phi_node->eraseFromParent();
       invalidate_local(i);
       continue;
@@ -221,13 +241,15 @@ void JeandleVMState::store(BasicType type, int index, llvm::Value* value) {
 }
 
 
-llvm::SmallVector<llvm::Value*> JeandleVMState::deopt_args(llvm::IRBuilder<>& builder, int bci) {
+llvm::SmallVector<llvm::Value*> JeandleVMState::deopt_args(llvm::IRBuilder<>& builder, ciMethod* method, int bci) {
   llvm::SmallVector<llvm::Value*> args;
+  MethodLivenessResult live_locals = method->liveness_at_bci(bci);
   // |--- bci ---|--- locals ---|--- stack ---|--- monitor ---|--- orig_pc ---|
   /* TODO: scalar */
   args.push_back(builder.getInt32(bci));
   for (size_t i = 0; i < _locals.size(); i++) {
-    if (!_locals[i].is_null()) {
+    bool is_live = !live_locals.is_valid() || live_locals.at(i);
+    if (!_locals[i].is_null() && is_live) {
       uint64_t encode = DeoptValueEncoding(i, DeoptValueEncoding::LocalType, _locals[i].computational_type()).encode();
 #ifdef ASSERT
       if (log_is_enabled(Trace, jeandle)) {
@@ -319,7 +341,27 @@ JeandleBasicBlock::JeandleBasicBlock(int block_id,
                                      _header_llvm_block(header_llvm_block),
                                      _tail_llvm_block(header_llvm_block),
                                      _ci_block(ci_block),
-                                     _initial_jvm(nullptr) {}
+                                     _initial_jvm(nullptr),
+                                     _jsr_scope(nullptr) {}
+
+bool JeandleBasicBlock::ends_with_ret(ciMethod* method) const {
+  assert(method != nullptr, "method must not be null");
+  if (_ci_block == nullptr || _ci_block->control_bci() == ciBlock::fall_through_bci) {
+    return false;
+  }
+  return method->java_code_at_bci(_ci_block->control_bci()) == Bytecodes::_ret;
+}
+
+void JeandleBasicBlock::clone_metadata_from(JeandleBasicBlock* block) {
+  assert(block != nullptr, "block must not be null");
+  if (block->is_set(is_loop_header)) {
+    set(is_loop_header);
+  }
+  if (block->is_set(always_uncommon_trap)) {
+    set(always_uncommon_trap);
+  }
+  set_reverse_post_order(block->reverse_post_order());
+}
 
 bool JeandleBasicBlock::merge_VM_state_from(JeandleVMState* vm_state, llvm::BasicBlock* incoming, ciMethod* method, bool is_osr) {
   if (_jvm == nullptr) {
@@ -328,9 +370,8 @@ bool JeandleBasicBlock::merge_VM_state_from(JeandleVMState* vm_state, llvm::Basi
       return false;
     }
 
-    if (_predecessors.size() == 1 && !is_exception_handler()) {
+    if (_predecessors.size() == 1 && !is_exception_handler() && !is_set(is_loop_header)) {
       // Just one predecessor. Copy its JeandleVMState.
-      assert(!is_set(is_loop_header), "should not be a loop header");
       _jvm = vm_state->copy();
     } else {
       // More than one predecessors. Set up phi nodes.
@@ -349,6 +390,9 @@ bool JeandleBasicBlock::merge_VM_state_from(JeandleVMState* vm_state, llvm::Basi
       return _jvm->update_phi_nodes(vm_state, incoming, is_osr);
     }
     assert(_initial_jvm != nullptr, "loop header initial JeandleVMState is needed");
+    return _initial_jvm->update_phi_nodes(vm_state, incoming, is_osr);
+  } else if (is_set(is_compiled) && (_predecessors.size() > 1 || is_exception_handler())) {
+    assert(_initial_jvm != nullptr, "initial JeandleVMState is needed for compiled join block");
     return _initial_jvm->update_phi_nodes(vm_state, incoming, is_osr);
   }
 
@@ -399,6 +443,81 @@ void JeandleBasicBlock::initialize_VM_state_from(JeandleVMState* incoming_state,
     llvm::PHINode* phi_node = ir_builder.CreatePHI(incoming_state->stack_at(i)->getType(), 2);
     phi_node->addIncoming(incoming_state->stack_at(i), incoming_block);
     _jvm->raw_push(TypedValue(incoming_state->stack_type_at(i), phi_node));
+  }
+}
+
+JsrScopeData::JsrScopeData(JsrScopeData* parent,
+                           int jsr_entry_bci,
+                           JeandleBasicBlock* jsr_continuation,
+                           llvm::SmallVector<JeandleBasicBlock*>& bci2block,
+                           ciMethod* method,
+                           llvm::LLVMContext* context,
+                           llvm::Function* llvm_func) :
+                           _parent(parent),
+                           _jsr_entry_bci(jsr_entry_bci),
+                           _jsr_ret_addr_local(-1),
+                           _jsr_continuation(jsr_continuation),
+                           _bci2block(bci2block),
+                           _original_to_clone(),
+                           _created_blocks(),
+                           _method(method),
+                           _context(context),
+                           _llvm_func(llvm_func) {}
+
+JeandleBasicBlock* JsrScopeData::block_at(int bci) {
+  assert(bci >= 0 && bci < (int)_bci2block.size(), "bci out of range");
+  JeandleBasicBlock* block = _bci2block[bci];
+  assert(block != nullptr, "missing block");
+
+  if (block->jsr_scope() == this) {
+    return block;
+  }
+
+  auto it = _original_to_clone.find(block);
+  if (it != _original_to_clone.end()) {
+    return it->second;
+  }
+
+  JeandleBasicBlock* clone = new JeandleBasicBlock(block->block_id(),
+                                                   block->start_bci(),
+                                                   block->limit_bci(),
+                                                   llvm::BasicBlock::Create(*_context,
+                                                                            "bci_" + std::to_string(block->start_bci()) +
+                                                                            "_jsr_" + std::to_string(_jsr_entry_bci),
+                                                                            _llvm_func),
+                                                   block->ci_block());
+  clone->set_jsr_scope(this);
+  clone->clone_metadata_from(block);
+
+  _original_to_clone[block] = clone;
+  _created_blocks.push_back(clone);
+  for (int cur_bci = clone->start_bci(); cur_bci < clone->limit_bci(); cur_bci++) {
+    _bci2block[cur_bci] = clone;
+  }
+
+  // ret is resolved by the active jsr scope, not by the conservative
+  // static ret successors used for liveness and loop marking.
+  if (!block->ends_with_ret(_method)) {
+    for (JeandleBasicBlock* successor : block->successors()) {
+      if (successor->is_exception_handler()) {
+        continue;
+      }
+      JeandleBasicBlock* cloned_successor = block_at(successor->start_bci());
+      BasicBlockBuilder::connect_block(cloned_successor, clone);
+    }
+  }
+
+  return clone;
+}
+
+void JsrScopeData::remove_dead_blocks() {
+  for (JeandleBasicBlock* block : _created_blocks) {
+    if (!block->is_set(JeandleBasicBlock::is_compiled)) {
+      llvm::BasicBlock* llvm_block = block->header_llvm_block();
+      if (llvm_block && llvm_block->getParent()) {
+        llvm_block->eraseFromParent();
+      }
+    }
   }
 }
 
@@ -490,6 +609,8 @@ void BasicBlockBuilder::setup_control_flow() {
 
   JeandleBasicBlock* current = nullptr;
   int limit_bci = _method->code_size();
+  llvm::SmallVector<JeandleBasicBlock*> jsr_exit_blocks;
+  llvm::SmallVector<JeandleBasicBlock*> ret_blocks;
 
   while (codes.next() != ciBytecodeStream::EOBC()) {
     int cur_bci = codes.cur_bci();
@@ -506,13 +627,17 @@ void BasicBlockBuilder::setup_control_flow() {
     switch (codes.cur_bc()) {
       // Track bytecodes that affect the control flow.
       case Bytecodes::_athrow:  // fall through
-      case Bytecodes::_ret:     // fall through
       case Bytecodes::_ireturn: // fall through
       case Bytecodes::_lreturn: // fall through
       case Bytecodes::_freturn: // fall through
       case Bytecodes::_dreturn: // fall through
       case Bytecodes::_areturn: // fall through
       case Bytecodes::_return:
+        current = nullptr;
+        break;
+
+      case Bytecodes::_ret:
+        ret_blocks.push_back(current);
         current = nullptr;
         break;
 
@@ -549,6 +674,22 @@ void BasicBlockBuilder::setup_control_flow() {
         current = nullptr;
         break;
 
+      case Bytecodes::_jsr:
+        if (codes.next_bci() < limit_bci) {
+          jsr_exit_blocks.push_back(_bci2block[codes.next_bci()]);
+        }
+        connect_block(_bci2block[codes.get_dest()], current);
+        current = nullptr;
+        break;
+
+      case Bytecodes::_jsr_w:
+        if (codes.next_bci() < limit_bci) {
+          jsr_exit_blocks.push_back(_bci2block[codes.next_bci()]);
+        }
+        connect_block(_bci2block[codes.get_far_dest()], current);
+        current = nullptr;
+        break;
+
       case Bytecodes::_lookupswitch: {
         // Set block for each case.
         Bytecode_lookupswitch sw(&codes);
@@ -575,6 +716,15 @@ void BasicBlockBuilder::setup_control_flow() {
 
       default:
         break;
+    }
+  }
+
+  for (JeandleBasicBlock* ret_block : ret_blocks) {
+    for (JeandleBasicBlock* jsr_exit : jsr_exit_blocks) {
+      if (ret_block == jsr_exit) {
+        continue;
+      }
+      connect_block(jsr_exit, ret_block);
     }
   }
 }
@@ -676,7 +826,10 @@ JeandleAbstractInterpreter::JeandleAbstractInterpreter(ciMethod* method,
                                                        _oops(),
                                                        _block(nullptr),
                                                        _jvm(nullptr),
+                                                       _jsr_scope_data(nullptr),
                                                        _work_list(),
+                                                       _jsr_scopes(),
+                                                       _skip_block_successors(false),
                                                        _sync_lock(LockValue()),
                                                        _trap_hist(trap_hist),
                                                        _oop_idx(0) {
@@ -1005,11 +1158,13 @@ void JeandleAbstractInterpreter::interpret() {
     _work_list.pop_back();
     current->clear(JeandleBasicBlock::is_on_work_list);
 
+    _jsr_scope_data = current->jsr_scope();
     interpret_block(current);
     RETURN_VOID_ON_JEANDLE_ERROR();
   }
 
   _block_builder->remove_dead_blocks();
+  remove_dead_jsr_blocks();
 }
 
 llvm::Value* JeandleAbstractInterpreter::ensure_orig_pc_slot() {
@@ -1035,14 +1190,17 @@ void JeandleAbstractInterpreter::interpret_block(JeandleBasicBlock* block) {
 
   _block = block;
   _jvm = block->VM_state();
+  _skip_block_successors = false;
 
   // Skip blocks that are unreachable.
   if (_jvm == nullptr) {
     return;
   }
 
-  if (block->is_set(JeandleBasicBlock::is_loop_header)) {
-    // Copy loop header's initial JeandleVMState.
+  if (block->is_set(JeandleBasicBlock::is_loop_header) ||
+      block->predecessors().size() > 1 ||
+      block->is_exception_handler()) {
+    // Copy the entry state before bytecode interpretation mutates it.
     block->set_initial_jvm(_jvm->copy());
   }
 
@@ -1059,7 +1217,7 @@ void JeandleAbstractInterpreter::interpret_block(JeandleBasicBlock* block) {
   // Iterate all bytecodes.
   while ((code = _bytecodes.next()) != ciBytecodeStream::EOBC() &&
           !JeandleCompilation::jeandle_error_occurred() &&
-          bci2block()[_bytecodes.cur_bci()] == _block &&
+          current_bci2block()[_bytecodes.cur_bci()] == _block &&
           !_block->is_set(JeandleBasicBlock::always_uncommon_trap)) {
     // Handle by opcode, see: https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-7.html
     switch (code) {
@@ -1122,11 +1280,11 @@ void JeandleAbstractInterpreter::interpret_block(JeandleBasicBlock* block) {
       case Bytecodes::_dload_3: _jvm->dpush(_jvm->dload(3)); break;
       case Bytecodes::_dload: _jvm->dpush(_jvm->dload(_bytecodes.get_index())); break;
 
-      case Bytecodes::_aload_0: _jvm->apush(_jvm->aload(0)); break;
-      case Bytecodes::_aload_1: _jvm->apush(_jvm->aload(1)); break;
-      case Bytecodes::_aload_2: _jvm->apush(_jvm->aload(2)); break;
-      case Bytecodes::_aload_3: _jvm->apush(_jvm->aload(3)); break;
-      case Bytecodes::_aload: _jvm->apush(_jvm->aload(_bytecodes.get_index())); break;
+      case Bytecodes::_aload_0: do_aload(0); break;
+      case Bytecodes::_aload_1: do_aload(1); break;
+      case Bytecodes::_aload_2: do_aload(2); break;
+      case Bytecodes::_aload_3: do_aload(3); break;
+      case Bytecodes::_aload: do_aload(_bytecodes.get_index()); break;
 
       case Bytecodes::_iaload: do_array_load(T_INT); break;
       case Bytecodes::_laload: do_array_load(T_LONG); break;
@@ -1163,11 +1321,11 @@ void JeandleAbstractInterpreter::interpret_block(JeandleBasicBlock* block) {
       case Bytecodes::_dstore_3: _jvm->dstore(3, _jvm->dpop()); break;
       case Bytecodes::_dstore: _jvm->dstore(_bytecodes.get_index(), _jvm->dpop()); break;
 
-      case Bytecodes::_astore_0: _jvm->astore(0, _jvm->apop()); break;
-      case Bytecodes::_astore_1: _jvm->astore(1, _jvm->apop()); break;
-      case Bytecodes::_astore_2: _jvm->astore(2, _jvm->apop()); break;
-      case Bytecodes::_astore_3: _jvm->astore(3, _jvm->apop()); break;
-      case Bytecodes::_astore: _jvm->astore(_bytecodes.get_index(), _jvm->apop()); break;
+      case Bytecodes::_astore_0: do_astore(0); break;
+      case Bytecodes::_astore_1: do_astore(1); break;
+      case Bytecodes::_astore_2: do_astore(2); break;
+      case Bytecodes::_astore_3: do_astore(3); break;
+      case Bytecodes::_astore: do_astore(_bytecodes.get_index()); break;
 
       case Bytecodes::_iastore: do_array_store(T_INT); break;
       case Bytecodes::_lastore: do_array_store(T_LONG); break;
@@ -1284,8 +1442,8 @@ void JeandleAbstractInterpreter::interpret_block(JeandleBasicBlock* block) {
       // Control:
 
       case Bytecodes::_goto: goto_bci(_bytecodes.get_dest()); break;
-      case Bytecodes::_jsr: Unimplemented(); break;
-      case Bytecodes::_ret: Unimplemented(); break;
+      case Bytecodes::_jsr: jsr(_bytecodes.get_dest()); break;
+      case Bytecodes::_ret: ret(_bytecodes.get_index()); break;
 
       case Bytecodes::_tableswitch: table_switch(); break;
       case Bytecodes::_lookupswitch: lookup_switch(); break;
@@ -1336,8 +1494,8 @@ void JeandleAbstractInterpreter::interpret_block(JeandleBasicBlock* block) {
       case Bytecodes::_ifnull: if_null(llvm::CmpInst::ICMP_EQ); break;
       case Bytecodes::_ifnonnull: if_null(llvm::CmpInst::ICMP_NE); break;
 
-      case Bytecodes::_goto_w: Unimplemented(); break;
-      case Bytecodes::_jsr_w: Unimplemented(); break;
+      case Bytecodes::_goto_w: goto_bci(_bytecodes.get_far_dest()); break;
+      case Bytecodes::_jsr_w: jsr(_bytecodes.get_far_dest()); break;
 
       // Reserved:
 
@@ -1354,7 +1512,7 @@ void JeandleAbstractInterpreter::interpret_block(JeandleBasicBlock* block) {
 
   // All blocks should have their terminator.
   if (block->tail_llvm_block()->getTerminator() == nullptr) {
-    _ir_builder.CreateBr(bci2block()[_bytecodes.cur_bci()]->header_llvm_block());
+    _ir_builder.CreateBr(block_at(_bytecodes.cur_bci())->header_llvm_block());
   }
 
   block->set(JeandleBasicBlock::is_compiled);
@@ -1371,10 +1529,17 @@ void JeandleAbstractInterpreter::interpret_block(JeandleBasicBlock* block) {
     return;
   }
 
+  if (_skip_block_successors) {
+    _skip_block_successors = false;
+    return;
+  }
+
   // Add all successors to work list and set up their JeandleVMStates.
   for (JeandleBasicBlock* suc : block->successors()) {
     // Don't update handlers' VM state here. They are updated by exception throwers.
     if (!suc->is_exception_handler() && !suc->merge_VM_state_from(block->VM_state(), block->tail_llvm_block(), _method, is_osr())) {
+      log_error(jeandle)("failed to merge VM state into successor: block [%d, %d) -> [%d, %d)",
+                         block->start_bci(), block->limit_bci(), suc->start_bci(), suc->limit_bci());
       JEANDLE_ERROR_ASSERT_AND_RET_VOID_ON_FAIL(false, "failed to merge VM state into successor block");
     }
 
@@ -1406,7 +1571,43 @@ void JeandleAbstractInterpreter::uncommon_trap(Deoptimization::DeoptReason reaso
   }
 }
 
+llvm::SmallVector<JeandleBasicBlock*>& JeandleAbstractInterpreter::current_bci2block() {
+  return _jsr_scope_data == nullptr ? bci2block() : _jsr_scope_data->bci2block();
+}
+
+JeandleBasicBlock* JeandleAbstractInterpreter::block_at(int bci) {
+  if (_jsr_scope_data == nullptr) {
+    assert(bci >= 0 && bci < (int)bci2block().size(), "bci out of range");
+    return bci2block()[bci];
+  }
+  return _jsr_scope_data->block_at(bci);
+}
+
+JsrScopeData* JeandleAbstractInterpreter::push_scope_for_jsr(JeandleBasicBlock* jsr_continuation, int jsr_dest_bci) {
+  JsrScopeData* jsr_scope = new JsrScopeData(_jsr_scope_data,
+                                             jsr_dest_bci,
+                                             jsr_continuation,
+                                             current_bci2block(),
+                                             _method,
+                                             _context,
+                                             _llvm_func);
+  _jsr_scopes.push_back(jsr_scope);
+  _jsr_scope_data = jsr_scope;
+  return jsr_scope;
+}
+
+void JeandleAbstractInterpreter::remove_dead_jsr_blocks() {
+  for (JsrScopeData* scope : _jsr_scopes) {
+    scope->remove_dead_blocks();
+  }
+}
+
 void JeandleAbstractInterpreter::add_to_work_list(JeandleBasicBlock* block) {
+  add_to_work_list(block, _jsr_scope_data);
+}
+
+void JeandleAbstractInterpreter::add_to_work_list(JeandleBasicBlock* block, JsrScopeData* jsr_scope) {
+  block->set_jsr_scope(jsr_scope);
   if (!block->is_set(JeandleBasicBlock::is_on_work_list)) {
     block->set(JeandleBasicBlock::is_on_work_list);
     _work_list.push_back(block);
@@ -1474,6 +1675,45 @@ void JeandleAbstractInterpreter::load_constant() {
   _jvm->push(con.basic_type(), value);
 }
 
+void JeandleAbstractInterpreter::do_aload(int index) {
+  BasicType type = _jvm->locals_type_at(index);
+  if (type == T_ADDRESS) {
+    _jvm->addrpush(_jvm->addrload(index));
+  } else {
+    _jvm->apush(_jvm->aload(index));
+  }
+}
+
+void JeandleAbstractInterpreter::do_astore(int index) {
+  TypedValue value = _jvm->raw_peek();
+  if (parsing_jsr()) {
+    if (value.actual_type() == T_ADDRESS) {
+      _jsr_scope_data->set_jsr_return_address_local(index);
+
+      for (JsrScopeData* scope = _jsr_scope_data->parent(); scope != nullptr; scope = scope->parent()) {
+        if (scope->jsr_return_address_local() == index) {
+          JEANDLE_REPORT_ERROR_AND_RET_VOID("subroutine overwrites return address from previous subroutine");
+        }
+      }
+    } else if (index == _jsr_scope_data->jsr_return_address_local()) {
+      _jsr_scope_data->set_jsr_return_address_local(-1);
+    }
+  }
+
+  value = _jvm->raw_pop();
+  switch (value.actual_type()) {
+    case T_ADDRESS:
+      _jvm->addrstore(index, value.value());
+      break;
+    case T_OBJECT:
+    case T_ARRAY:
+      _jvm->store(value.actual_type(), index, value.value());
+      break;
+    default:
+      JEANDLE_REPORT_ERROR_AND_RET_VOID("astore encountered non-reference value");
+  }
+}
+
 void JeandleAbstractInterpreter::increment() {
   llvm::Value* con = JeandleType::int_const(_ir_builder, _bytecodes.get_iinc_con());
   llvm::Value* result = _ir_builder.CreateAdd(_jvm->iload(_bytecodes.get_index()), con);
@@ -1486,9 +1726,17 @@ void JeandleAbstractInterpreter::if_zero(llvm::CmpInst::Predicate p) {
   }
   llvm::Value* v = _jvm->ipop();
   llvm::Value* cond = _ir_builder.CreateICmp(p, v, JeandleType::int_const(_ir_builder, 0));
+  JeandleBasicBlock* true_succ = block_at(_bytecodes.get_dest());
+  JeandleBasicBlock* false_succ = block_at(_bytecodes.next_bci());
+  if (true_succ->is_exception_handler()) {
+    merge_into_exception_handler(true_succ);
+  }
+  if (false_succ->is_exception_handler()) {
+    merge_into_exception_handler(false_succ);
+  }
   _ir_builder.CreateCondBr(cond,
-                           bci2block()[_bytecodes.get_dest()]->header_llvm_block(),
-                           bci2block()[_bytecodes.next_bci()]->header_llvm_block());
+                           true_succ->header_llvm_block(),
+                           false_succ->header_llvm_block());
 }
 
 void JeandleAbstractInterpreter::if_icmp(llvm::CmpInst::Predicate p) {
@@ -1498,8 +1746,8 @@ void JeandleAbstractInterpreter::if_icmp(llvm::CmpInst::Predicate p) {
   llvm::Value* r = _jvm->ipop();
   llvm::Value* l = _jvm->ipop();
   llvm::Value* cond = _ir_builder.CreateICmp(p, l, r);
-  JeandleBasicBlock* true_succ = bci2block()[_bytecodes.get_dest()];
-  JeandleBasicBlock* false_succ = bci2block()[_bytecodes.next_bci()];
+  JeandleBasicBlock* true_succ = block_at(_bytecodes.get_dest());
+  JeandleBasicBlock* false_succ = block_at(_bytecodes.next_bci());
   if (true_succ->is_exception_handler()) {
     merge_into_exception_handler(true_succ);
   }
@@ -1528,9 +1776,17 @@ void JeandleAbstractInterpreter::if_acmp(llvm::CmpInst::Predicate p) {
   llvm::Value* r = _jvm->apop();
   llvm::Value* l = _jvm->apop();
   llvm::Value* cond = _ir_builder.CreateICmp(p, l, r);
+  JeandleBasicBlock* true_succ = block_at(_bytecodes.get_dest());
+  JeandleBasicBlock* false_succ = block_at(_bytecodes.next_bci());
+  if (true_succ->is_exception_handler()) {
+    merge_into_exception_handler(true_succ);
+  }
+  if (false_succ->is_exception_handler()) {
+    merge_into_exception_handler(false_succ);
+  }
   _ir_builder.CreateCondBr(cond,
-                           bci2block()[_bytecodes.get_dest()]->header_llvm_block(),
-                           bci2block()[_bytecodes.next_bci()]->header_llvm_block());
+                           true_succ->header_llvm_block(),
+                           false_succ->header_llvm_block());
 }
 
 void JeandleAbstractInterpreter::if_null(llvm::CmpInst::Predicate p) {
@@ -1539,9 +1795,17 @@ void JeandleAbstractInterpreter::if_null(llvm::CmpInst::Predicate p) {
   }
   llvm::Value* v = _jvm->apop();
   llvm::Value* cond = _ir_builder.CreateICmp(p, v, llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(v->getType())));
+  JeandleBasicBlock* true_succ = block_at(_bytecodes.get_dest());
+  JeandleBasicBlock* false_succ = block_at(_bytecodes.next_bci());
+  if (true_succ->is_exception_handler()) {
+    merge_into_exception_handler(true_succ);
+  }
+  if (false_succ->is_exception_handler()) {
+    merge_into_exception_handler(false_succ);
+  }
   _ir_builder.CreateCondBr(cond,
-                           bci2block()[_bytecodes.get_dest()]->header_llvm_block(),
-                           bci2block()[_bytecodes.next_bci()]->header_llvm_block());
+                           true_succ->header_llvm_block(),
+                           false_succ->header_llvm_block());
 }
 
 /*
@@ -1579,17 +1843,88 @@ void JeandleAbstractInterpreter::merge_into_exception_handler(JeandleBasicBlock*
   if (!handler_block->merge_VM_state_from(adjusted_state, _ir_builder.GetInsertBlock(), _method, is_osr())) {
     JEANDLE_ERROR_ASSERT_AND_RET_VOID_ON_FAIL(false, "failed to merge VM state into exception handler block from normal flow");
   }
+  if (!handler_block->is_set(JeandleBasicBlock::is_compiled)) {
+    add_to_work_list(handler_block);
+  }
 }
 
 void JeandleAbstractInterpreter::goto_bci(int bci) {
   if (bci <= _bytecodes.cur_bci()) {
     add_safepoint_poll();
   }
-  JeandleBasicBlock* succ = bci2block()[bci];
+  JeandleBasicBlock* succ = block_at(bci);
   if (succ->is_exception_handler()) {
     merge_into_exception_handler(succ);
   }
   _ir_builder.CreateBr(succ->header_llvm_block());
+}
+
+void JeandleAbstractInterpreter::jsr(int dest) {
+  int next = _bytecodes.next_bci();
+  if (next >= _method->code_size()) {
+    JEANDLE_REPORT_ERROR_AND_RET_VOID("too-complicated jsr/ret structure");
+  }
+
+  for (JsrScopeData* scope = _jsr_scope_data; scope != nullptr; scope = scope->parent()) {
+    if (scope->jsr_entry_bci() == dest) {
+      JEANDLE_REPORT_ERROR_AND_RET_VOID("recursive jsr is not supported");
+    }
+  }
+
+  JeandleBasicBlock* continuation = block_at(next);
+  JsrScopeData* jsr_scope = push_scope_for_jsr(continuation, dest);
+  JeandleBasicBlock* jsr_start = block_at(dest);
+
+  llvm::Value* return_address =
+      _ir_builder.CreateIntToPtr(_ir_builder.getInt64(next), JeandleType::java2llvm(T_ADDRESS, *_context));
+  _jvm->addrpush(return_address);
+
+  if (!llvm::is_contained(jsr_start->predecessors(), _block)) {
+    BasicBlockBuilder::connect_block(jsr_start, _block);
+  }
+  _ir_builder.CreateBr(jsr_start->header_llvm_block());
+  _block->set_tail_llvm_block(_ir_builder.GetInsertBlock());
+
+  bool merged = jsr_start->merge_VM_state_from(_jvm, _block->tail_llvm_block(), _method, is_osr());
+  JEANDLE_ERROR_ASSERT_AND_RET_VOID_ON_FAIL(merged, "failed to merge VM state into jsr subroutine");
+  add_to_work_list(jsr_start, jsr_scope);
+
+  _jsr_scope_data = jsr_scope->parent();
+  _skip_block_successors = true;
+  _bytecodes.force_bci(_block->limit_bci());
+}
+
+void JeandleAbstractInterpreter::ret(int index) {
+  if (!parsing_jsr()) {
+    JEANDLE_REPORT_ERROR_AND_RET_VOID("ret encountered while not parsing subroutine");
+  }
+
+  if (index != _jsr_scope_data->jsr_return_address_local()) {
+    JEANDLE_REPORT_ERROR_AND_RET_VOID("can not handle complicated jsr/ret constructs");
+  }
+
+  _jvm->invalidate_local(index);
+
+  JeandleBasicBlock* continuation = _jsr_scope_data->jsr_continuation();
+  if (continuation->start_bci() <= _bytecodes.cur_bci()) {
+    add_safepoint_poll();
+  }
+
+  if (!llvm::is_contained(continuation->predecessors(), _block)) {
+    BasicBlockBuilder::connect_block(continuation, _block);
+  }
+  _ir_builder.CreateBr(continuation->header_llvm_block());
+  _block->set_tail_llvm_block(_ir_builder.GetInsertBlock());
+
+  JsrScopeData* parent_scope = _jsr_scope_data->parent();
+  bool merged = continuation->merge_VM_state_from(_jvm, _block->tail_llvm_block(), _method, is_osr());
+  JEANDLE_ERROR_ASSERT_AND_RET_VOID_ON_FAIL(merged, "failed to merge VM state into jsr continuation");
+  if (!continuation->is_set(JeandleBasicBlock::is_compiled)) {
+    add_to_work_list(continuation, parent_scope);
+  }
+
+  _skip_block_successors = true;
+  _bytecodes.force_bci(_block->limit_bci());
 }
 
 void JeandleAbstractInterpreter::lookup_switch() {
@@ -1611,7 +1946,7 @@ void JeandleAbstractInterpreter::lookup_switch() {
   }
 
   llvm::Value* key = _jvm->ipop();
-  JeandleBasicBlock* default_block = bci2block()[cur_bci + sw.default_offset()];
+  JeandleBasicBlock* default_block = block_at(cur_bci + sw.default_offset());
   if (default_block->is_exception_handler()) {
     merge_into_exception_handler(default_block);
   }
@@ -1619,7 +1954,7 @@ void JeandleAbstractInterpreter::lookup_switch() {
 
   for (int i = 0; i < length; i++) {
     LookupswitchPair pair = sw.pair_at(i);
-    JeandleBasicBlock* case_block = bci2block()[cur_bci + pair.offset()];
+    JeandleBasicBlock* case_block = block_at(cur_bci + pair.offset());
     if (case_block->is_exception_handler()) {
       merge_into_exception_handler(case_block);
     }
@@ -1646,14 +1981,14 @@ void JeandleAbstractInterpreter::table_switch() {
   }
 
   llvm::Value* idx = _jvm->ipop();
-  JeandleBasicBlock* default_block = bci2block()[cur_bci + sw.default_offset()];
+  JeandleBasicBlock* default_block = block_at(cur_bci + sw.default_offset());
   if (default_block->is_exception_handler()) {
     merge_into_exception_handler(default_block);
   }
   llvm::SwitchInst* switch_inst = _ir_builder.CreateSwitch(idx, default_block->header_llvm_block(), length);
 
   for (int i = 0; i < length; i++) {
-    JeandleBasicBlock* case_block = bci2block()[cur_bci + sw.dest_offset_at(i)];
+    JeandleBasicBlock* case_block = block_at(cur_bci + sw.dest_offset_at(i));
     if (case_block->is_exception_handler()) {
       merge_into_exception_handler(case_block);
     }
@@ -2312,7 +2647,7 @@ llvm::InvokeInst* JeandleAbstractInterpreter::call_java_op_ex(llvm::StringRef ja
 
 llvm::OperandBundleDef JeandleAbstractInterpreter::create_current_deopt_bundle() {
   ensure_orig_pc_slot();
-  return llvm::OperandBundleDef("deopt", _jvm->deopt_args(_ir_builder, _bytecodes.cur_bci()));
+  return llvm::OperandBundleDef("deopt", _jvm->deopt_args(_ir_builder, _method, _bytecodes.cur_bci()));
 }
 
 llvm::Value* JeandleAbstractInterpreter::find_or_insert_oop(ciObject* oop) {
@@ -2860,7 +3195,7 @@ void JeandleAbstractInterpreter::dispatch_exception_to_handler(llvm::Value* exce
       return;
     }
     int handler_bci = handler->handler_bci();
-    JeandleBasicBlock* handler_block = bci2block()[handler_bci];
+    JeandleBasicBlock* handler_block = block_at(handler_bci);
     assert(handler_block != nullptr, "invalid handler block");
 
     // catch_all
@@ -2872,6 +3207,9 @@ void JeandleAbstractInterpreter::dispatch_exception_to_handler(llvm::Value* exce
                                                        _ir_builder.GetInsertBlock(),
                                                        _method, is_osr());
       JEANDLE_ERROR_ASSERT_AND_RET_VOID_ON_FAIL(merged, "failed to update handler's VM state");
+      if (!handler_block->is_set(JeandleBasicBlock::is_compiled)) {
+        add_to_work_list(handler_block);
+      }
       _ir_builder.CreateBr(handler_block->header_llvm_block());
       return;
     }
@@ -2922,12 +3260,18 @@ void JeandleAbstractInterpreter::dispatch_exception_to_handler(llvm::Value* exce
                                                      _ir_builder.GetInsertBlock(),
                                                      _method, is_osr());
       JEANDLE_ERROR_ASSERT_AND_RET_VOID_ON_FAIL(merged, "failed to update handler's VM state");
+      if (!handler_block->is_set(JeandleBasicBlock::is_compiled)) {
+        add_to_work_list(handler_block);
+      }
       _ir_builder.CreateBr(match_dest);
     } else {
       bool merged = handler_block->merge_VM_state_from(_jvm->copy_for_exception_handler(exception_oop),
                                                      _ir_builder.GetInsertBlock(),
                                                      _method, is_osr());
       JEANDLE_ERROR_ASSERT_AND_RET_VOID_ON_FAIL(merged, "failed to update handler's VM state");
+      if (!handler_block->is_set(JeandleBasicBlock::is_compiled)) {
+        add_to_work_list(handler_block);
+      }
       _ir_builder.CreateCondBr(cond, match_dest, next_dest);
     }
     _ir_builder.SetInsertPoint(next_dest);
