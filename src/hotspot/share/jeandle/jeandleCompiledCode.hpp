@@ -39,6 +39,7 @@
 #include "jeandle/jeandleReadELF.hpp"
 #include "jeandle/jeandleResourceObj.hpp"
 #include "jeandle/jeandleUtils.hpp"
+#include "llvm/IR/Jeandle/Deoptimization.h"
 
 #include "jeandle/__hotspotHeadersBegin__.hpp"
 #include "asm/codeBuffer.hpp"
@@ -64,6 +65,10 @@ static inline const char* value_type_name(DeoptValueEncoding::DeoptValueType t) 
     case DeoptValueEncoding::MonitorType: return "MonitorType";
     case DeoptValueEncoding::ScalarValueType: return "ScalarValueType";
     case DeoptValueEncoding::OrigPcSlotType: return "OrigPcSlotType";
+    case DeoptValueEncoding::MethodType: return "MethodType";
+    case DeoptValueEncoding::NarrowOopMarkerType: return "NarrowOopMarkerType";
+    case DeoptValueEncoding::LazyObjectType: return "LazyObjectType";
+    case DeoptValueEncoding::LazyObjectFieldType: return "LazyObjectFieldType";
     default: return "Unknown";
   }
 }
@@ -113,8 +118,8 @@ class CallSiteInfo : public JeandleCompilationResourceObj {
 
 class JeandleStackMap : public JeandleCompilationResourceObj {
 public:
-  JeandleStackMap(int bci, ciMethod* method, OopMap* oop_map, GrowableArray<ScopeValue*>* locals, GrowableArray<ScopeValue*>* stack, GrowableArray<MonitorValue*>* monitors, bool reexecute) :
-      _bci(bci), _method(method), _oop_map(oop_map), _locals(locals), _stack(stack), _monitors(monitors), _reexecute(reexecute) {
+  JeandleStackMap(int bci, ciMethod* method, OopMap* oop_map, GrowableArray<ScopeValue*>* locals, GrowableArray<ScopeValue*>* stack, GrowableArray<MonitorValue*>* monitors, GrowableArray<ScopeValue*>* objects, bool reexecute) :
+      _bci(bci), _method(method), _oop_map(oop_map), _locals(locals), _stack(stack), _monitors(monitors), _objects(objects), _reexecute(reexecute) {
   }
 
   int bci() const { return _bci; }
@@ -123,6 +128,7 @@ public:
   GrowableArray<ScopeValue*>* locals() const { return _locals; }
   GrowableArray<ScopeValue*>* stack() const { return _stack; }
   GrowableArray<MonitorValue*>* monitors() const { return _monitors; }
+  GrowableArray<ScopeValue*>* objects() const { return _objects; }
   bool reexecute() const { return _reexecute; }
 
 private:
@@ -132,6 +138,7 @@ private:
   GrowableArray<ScopeValue*>* _locals;
   GrowableArray<ScopeValue*>* _stack;
   GrowableArray<MonitorValue*>* _monitors;
+  GrowableArray<ScopeValue*>* _objects;
   bool _reexecute;
 };
 
@@ -323,12 +330,19 @@ class JeandleCompiledCode : public StackObj {
                                   StackMapParser::RecordAccessor::location_iterator& location,
                                   int& num_deopts,
                                   const JeandleParseContext& parse_context,
+                                  GrowableArray<ScopeValue*>* objects,
                                   ciMethod*& next_inlinee);
   LocationValue* new_location_value(const StackMapParser::LocationAccessor& location, Location::Type type);
   void fill_one_scope_value(const StackMapParser& stackmaps, const DeoptValueEncoding& encode,
-                            const StackMapParser::LocationAccessor& location, GrowableArray<ScopeValue*>* array);
+                            const StackMapParser::LocationAccessor& location, GrowableArray<ScopeValue*>* array,
+                            GrowableArray<ScopeValue*>* objects = nullptr);
   void fill_one_monitor_value(const StackMapParser& stackmaps, const DeoptValueEncoding& encode, const StackMapParser::LocationAccessor& object,
-                              const StackMapParser::LocationAccessor& lock, GrowableArray<MonitorValue*>* array);
+                              const StackMapParser::LocationAccessor& lock, GrowableArray<MonitorValue*>* array,
+                              GrowableArray<ScopeValue*>* objects = nullptr);
+  int fill_one_lazy_object(const StackMapParser& stackmaps, const DeoptValueEncoding& encode,
+                             StackMapParser::RecordAccessor::location_iterator& location,
+                             StackMapParser::RecordAccessor::location_iterator location_end,
+                             GrowableArray<ScopeValue*>* objects);
 
   void build_exception_handler_table();
   bool pd_build_exception_handler_table();

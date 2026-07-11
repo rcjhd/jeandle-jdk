@@ -154,6 +154,10 @@ class ObjectValue: public ScopeValue {
   bool                        is_visited() const        { return _visited; }
 
   void                        set_value(oop value);
+  void                        set_klass(ScopeValue* klass) {
+    assert(klass->is_constant_oop(), "should be constant java mirror oop");
+    _klass = klass;
+  }
   void                        set_visited(bool visited) { _visited = visited; }
 
   // Serialization of debugging information

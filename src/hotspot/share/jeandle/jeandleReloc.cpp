@@ -110,6 +110,19 @@ void JeandleCallReloc::process_stack_map() {
     JeandleCompilation::current()->compiled_code()->set_has_method_handle_invoke(true);
   }
 
+  GrowableArray<ScopeValue*>* objects = nullptr;
+  for (JeandleStackMap* stack_map : _stack_maps) {
+    GrowableArray<ScopeValue*>* scope_objects = stack_map->objects();
+    if (scope_objects != nullptr && !scope_objects->is_empty()) {
+      objects = scope_objects;
+      break;
+    }
+  }
+  bool has_ea_local_in_scope = objects != nullptr && !objects->is_empty();
+  if (has_ea_local_in_scope) {
+    recorder->dump_object_pool(objects);
+  }
+
   for (JeandleStackMap* stack_map : _stack_maps) {
     DebugToken *locvals = recorder->create_scope_values(stack_map->locals());
     DebugToken *expvals = recorder->create_scope_values(stack_map->stack());
@@ -123,7 +136,7 @@ void JeandleCallReloc::process_stack_map() {
                              false,
                              _call->is_method_handle_invoke(),
                              false,
-                             false,
+                             has_ea_local_in_scope,
                              false,
                              locvals,
                              expvals,

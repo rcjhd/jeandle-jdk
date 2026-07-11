@@ -41,11 +41,109 @@
 #include "gc/shared/barrierSetAssembler.hpp"
 #include "interpreter/interpreter.hpp"
 #include "logging/log.hpp"
+#include "oops/fieldStreams.inline.hpp"
+#include "oops/instanceKlass.hpp"
+#include "oops/klass.inline.hpp"
+#include "runtime/jniHandles.hpp"
 #include "runtime/os.hpp"
+#include "runtime/signature.hpp"
 
 // Provide swap overload for JeandleReloc* to resolve ambiguity
 inline void swap(JeandleReloc*& a, JeandleReloc*& b) {
   std::swap(a, b);
+}
+
+class JeandleScalarFieldDesc {
+public:
+  int _offset;
+  BasicType _type;
+
+  JeandleScalarFieldDesc() : _offset(0), _type(T_ILLEGAL) {}
+  JeandleScalarFieldDesc(int offset, BasicType type) : _offset(offset), _type(type) {}
+};
+
+static int compare_jeandle_scalar_field_desc(JeandleScalarFieldDesc* left,
+                                             JeandleScalarFieldDesc* right) {
+  return left->_offset - right->_offset;
+}
+
+class JeandleExplicitScalarField {
+public:
+  int _offset;
+  GrowableArray<ScopeValue*>* _values;
+
+  JeandleExplicitScalarField() : _offset(0), _values(nullptr) {}
+  JeandleExplicitScalarField(int offset, GrowableArray<ScopeValue*>* values)
+      : _offset(offset), _values(values) {}
+};
+
+static ObjectValue* find_object_value(GrowableArray<ScopeValue*>* objects, int id) {
+  if (objects == nullptr) return nullptr;
+  for (int i = 0; i < objects->length(); i++) {
+    ScopeValue* sv = objects->at(i);
+    if (sv->is_object() && sv->as_ObjectValue()->id() == id) {
+      return sv->as_ObjectValue();
+    }
+  }
+  return nullptr;
+}
+
+static ObjectValue* get_or_create_object_value(GrowableArray<ScopeValue*>* objects, int id) {
+  assert(objects != nullptr, "lazy object pool must exist");
+  ObjectValue* obj = find_object_value(objects, id);
+  if (obj == nullptr) {
+    obj = new ObjectValue(id);
+    objects->append(obj);
+  }
+  return obj;
+}
+
+static GrowableArray<ScopeValue*>* find_explicit_scalar_field(GrowableArray<JeandleExplicitScalarField>* fields,
+                                                              int offset) {
+  if (fields == nullptr) return nullptr;
+  for (int i = 0; i < fields->length(); i++) {
+    JeandleExplicitScalarField* field = fields->adr_at(i);
+    if (field->_offset == offset) {
+      return field->_values;
+    }
+  }
+  return nullptr;
+}
+
+static void append_scope_values(GrowableArray<ScopeValue*>* dst,
+                                GrowableArray<ScopeValue*>* src) {
+  for (int i = 0; i < src->length(); i++) {
+    dst->append(src->at(i));
+  }
+}
+
+static void append_default_scope_value(BasicType type, GrowableArray<ScopeValue*>* array) {
+  switch (type) {
+    case T_OBJECT:
+    case T_ARRAY:
+      array->append(new ConstantOopWriteValue(nullptr));
+      break;
+    case T_LONG:
+      array->append(new ConstantIntValue((jint)0));
+      array->append(new ConstantLongValue((jlong)0));
+      break;
+    case T_DOUBLE:
+      array->append(new ConstantIntValue((jint)0));
+      array->append(new ConstantDoubleValue((jdouble)0));
+      break;
+    case T_FLOAT:
+      array->append(new ConstantIntValue(jint_cast((jfloat)0)));
+      break;
+    case T_BOOLEAN:
+    case T_BYTE:
+    case T_CHAR:
+    case T_SHORT:
+    case T_INT:
+      array->append(new ConstantIntValue((jint)0));
+      break;
+    default:
+      ShouldNotReachHere();
+  }
 }
 
 // Decide whether to emit a stack overflow check for the compiled entry based on
@@ -386,6 +484,7 @@ void JeandleCompiledCode::resolve_reloc_info(JeandleAssembler& assembler) {
       if (call_info) {
         auto location = record->location_begin();
         int num_deopts = parse_stackmap_prologue(record, location);
+        GrowableArray<ScopeValue*>* objects = num_deopts > 0 ? new GrowableArray<ScopeValue*>() : nullptr;
         JeandleCallReloc* reloc = new JeandleCallReloc(inst_end_offset, _env, _method, call_info);
         JeandleParseContext parse_context = _method != nullptr ? JeandleParseContext::root(_method)
                                                                : JeandleParseContext();
@@ -502,7 +601,8 @@ LocationValue* JeandleCompiledCode::new_location_value(const StackMapParser::Loc
 void JeandleCompiledCode::fill_one_scope_value(const StackMapParser& stackmaps,
                                                const DeoptValueEncoding& encode,
                                                const StackMapParser::LocationAccessor& location,
-                                               GrowableArray<ScopeValue*>* array) {
+                                               GrowableArray<ScopeValue*>* array,
+                                               GrowableArray<ScopeValue*>* objects) {
   assert(array != nullptr, "sanity");
   bool is_constant = StackMapUtil::is_constant(location);
   switch (static_cast<BasicType>(encode.basicType())) {
@@ -544,14 +644,15 @@ void JeandleCompiledCode::fill_one_scope_value(const StackMapParser& stackmaps,
     }
     break;
   }
-  case T_OBJECT: {
+  case T_OBJECT:
+  case T_ARRAY: {
     if (is_constant) {
       uint64_t v = StackMapUtil::getConstantUlong(stackmaps, location);
       if (v == 0L) {
         array->append(new ConstantOopWriteValue(nullptr));
       } else {
-        /* No constant oop is embedding into code */
-        ShouldNotReachHere();
+        /* Non-zero object constants in Jeandle deopt info are lazy-object ids. */
+        array->append(get_or_create_object_value(objects, (int)v));
       }
     } else {
       array->append(new_location_value(location, Location::oop));
@@ -574,9 +675,11 @@ void JeandleCompiledCode::fill_one_monitor_value(const StackMapParser& stackmaps
                                                  const DeoptValueEncoding& encode,
                                                  const StackMapParser::LocationAccessor& object,
                                                  const StackMapParser::LocationAccessor& lock,
-                                                 GrowableArray<MonitorValue*>* array) {
+                                                 GrowableArray<MonitorValue*>* array,
+                                                 GrowableArray<ScopeValue*>* objects) {
   assert(array != nullptr, "sanity");
-  assert(static_cast<BasicType>(encode.basicType()) == T_OBJECT, "should be");
+  assert(static_cast<BasicType>(encode.basicType()) == T_OBJECT ||
+         static_cast<BasicType>(encode.basicType()) == T_ARRAY, "should be");
 
   bool is_constant = StackMapUtil::is_constant(object);
   ScopeValue* locked_object = nullptr;
@@ -585,14 +688,101 @@ void JeandleCompiledCode::fill_one_monitor_value(const StackMapParser& stackmaps
     if (v == 0L) {
       locked_object = new ConstantOopWriteValue(nullptr);
     } else {
-      /* No constant oop is embedding into code */
-      ShouldNotReachHere();
+      /* Non-zero object constants in Jeandle deopt info are lazy-object ids. */
+      locked_object = get_or_create_object_value(objects, (int)v);
     }
   } else {
     locked_object = new_location_value(object, Location::oop);
   }
   Location basic_lock = Location::new_stk_loc(Location::normal, StackMapUtil::stack_offset(lock));
   array->append(new MonitorValue(locked_object, basic_lock, false /* eliminated */));
+}
+
+int JeandleCompiledCode::fill_one_lazy_object(const StackMapParser& stackmaps,
+                                               const DeoptValueEncoding& encode,
+                                               StackMapParser::RecordAccessor::location_iterator& location,
+                                               StackMapParser::RecordAccessor::location_iterator location_end,
+                                               GrowableArray<ScopeValue*>* objects) {
+  assert(objects != nullptr, "lazy object pool must exist");
+  assert(encode.valueType() == DeoptValueEncoding::LazyObjectType, "should be");
+  assert(static_cast<BasicType>(encode.basicType()) == T_OBJECT, "should be");
+
+  int consumed = 1; // The LazyObjectType encoding operand itself.
+  assert(location != location_end, "missing lazy object klass");
+  auto klass_location = *(location++);
+  Klass* klass = (Klass*)StackMapUtil::getConstantUlong(stackmaps, klass_location);
+  consumed++;
+
+  jobject mirror = JNIHandles::make_local(klass->java_mirror());
+  ScopeValue* klass_value = new ConstantOopWriteValue(mirror);
+  ObjectValue* obj = find_object_value(objects, encode.index());
+  if (obj == nullptr) {
+    obj = new ObjectValue(encode.index(), klass_value);
+    objects->append(obj);
+  } else if (obj->klass() == nullptr) {
+    obj->set_klass(klass_value);
+  }
+
+  assert(location != location_end, "missing lazy object field count");
+  auto field_count_location = *(location++);
+  int field_count = (int)StackMapUtil::getConstantUlong(stackmaps, field_count_location);
+  consumed++;
+
+  GrowableArray<JeandleExplicitScalarField>* explicit_fields = new GrowableArray<JeandleExplicitScalarField>(field_count);
+  for (int i = 0; i < field_count; i++) {
+    assert(location != location_end, "missing scalar field offset");
+    auto offset_location = *(location++);
+    int offset = (int)StackMapUtil::getConstantUlong(stackmaps, offset_location);
+
+    assert(location != location_end, "missing scalar field encoding");
+    auto field_encode_location = *(location++);
+    uint64_t field_encode = StackMapUtil::getConstantUlong(stackmaps, field_encode_location);
+    DeoptValueEncoding field_enc = DeoptValueEncoding::decode(field_encode);
+    assert(field_enc.valueType() == DeoptValueEncoding::LazyObjectFieldType,
+           "lazy object field encoding expected");
+    assert(field_enc.index() == 0, "lazy object field has no slot index");
+
+    assert(location != location_end, "missing scalar field value");
+    auto value_location = *(location++);
+
+    GrowableArray<ScopeValue*>* values = new GrowableArray<ScopeValue*>(2);
+    fill_one_scope_value(stackmaps, field_enc, value_location, values, objects);
+    explicit_fields->append(JeandleExplicitScalarField(offset, values));
+    consumed += 3;
+  }
+
+  if (obj->field_size() != 0) {
+    return consumed;
+  }
+
+  if (!klass->is_instance_klass()) {
+    // Array lazy objects need element-count based reconstruction; PEA only
+    // emits instance LazyObjectType records for now.
+    Unimplemented();
+  }
+
+  GrowableArray<JeandleScalarFieldDesc>* fields = new GrowableArray<JeandleScalarFieldDesc>();
+  InstanceKlass* ik = InstanceKlass::cast(klass);
+  while (ik != nullptr) {
+    for (AllFieldStream fs(ik); !fs.done(); fs.next()) {
+      if (!fs.access_flags().is_static() && !fs.field_flags().is_injected()) {
+        fields->append(JeandleScalarFieldDesc(fs.offset(), Signature::basic_type(fs.signature())));
+      }
+    }
+    ik = ik->superklass();
+  }
+  fields->sort(compare_jeandle_scalar_field_desc);
+
+  for (int i = 0; i < fields->length(); i++) {
+    JeandleScalarFieldDesc* field = fields->adr_at(i);
+    if (GrowableArray<ScopeValue*>* values = find_explicit_scalar_field(explicit_fields, field->_offset)) {
+      append_scope_values(obj->field_values(), values);
+    } else {
+      append_default_scope_value(field->_type, obj->field_values());
+    }
+  }
+
+  return consumed;
 }
 
 static bool bytecode_should_reexecute(Bytecodes::Code code) {
@@ -634,6 +824,7 @@ JeandleStackMap* JeandleCompiledCode::parse_stackmap(StackMapParser& stackmaps,
                                                      StackMapParser::RecordAccessor::location_iterator& location,
                                                      int& num_deopts,
                                                      const JeandleParseContext& parse_context,
+                                                     GrowableArray<ScopeValue*>* objects,
                                                      ciMethod*& next_inlinee) {
   bool reexecute = false;
   int bci = -1;
@@ -695,7 +886,7 @@ JeandleStackMap* JeandleCompiledCode::parse_stackmap(StackMapParser& stackmaps,
 
         bool is_local = type == DeoptValueEncoding::LocalType;
         fill_one_scope_value(stackmaps, enc, value_location,
-                             is_local ? locals : stack);
+                             is_local ? locals : stack, objects);
         num_deopts -= 2;
         break;
       }
@@ -706,8 +897,13 @@ JeandleStackMap* JeandleCompiledCode::parse_stackmap(StackMapParser& stackmaps,
         assert(location != record->location_end(), "must be in range");
         auto lock_location = *(location++);
 
-        fill_one_monitor_value(stackmaps, enc, obj_location, lock_location, monitors);
+        fill_one_monitor_value(stackmaps, enc, obj_location, lock_location, monitors, objects);
         num_deopts -= 3;
+        break;
+      }
+      case DeoptValueEncoding::LazyObjectType: {
+        int consumed = fill_one_lazy_object(stackmaps, enc, location, record->location_end(), objects);
+        num_deopts -= consumed;
         break;
       }
       case DeoptValueEncoding::OrigPcSlotType: {
@@ -727,7 +923,7 @@ JeandleStackMap* JeandleCompiledCode::parse_stackmap(StackMapParser& stackmaps,
         // The marker belongs to the next inlinee scope. Return the caller scope
         // now and let the outer loop continue parsing from the same stackmap
         // record; only the youngest scope consumes the oopmap tail.
-        return new JeandleStackMap(bci, current_method, nullptr, locals, stack, monitors, reexecute);
+        return new JeandleStackMap(bci, current_method, nullptr, locals, stack, monitors, objects, reexecute);
       }
       case DeoptValueEncoding::NarrowOopMarkerType: {
         assert(UseCompressedOops, "narrowoop only valid with CompressedOops");
@@ -798,7 +994,7 @@ JeandleStackMap* JeandleCompiledCode::parse_stackmap(StackMapParser& stackmaps,
       oop_map->set_narrowoop(reg_derived);
     }
   }
-  return new JeandleStackMap(bci, current_method, oop_map, locals, stack, monitors, reexecute);
+  return new JeandleStackMap(bci, current_method, oop_map, locals, stack, monitors, objects, reexecute);
 }
 
 void JeandleCompiledCode::build_exception_handler_table() {
