@@ -41,9 +41,12 @@
 #include "gc/shared/barrierSetAssembler.hpp"
 #include "interpreter/interpreter.hpp"
 #include "logging/log.hpp"
+#include "oops/arrayOop.hpp"
 #include "oops/fieldStreams.inline.hpp"
 #include "oops/instanceKlass.hpp"
 #include "oops/klass.inline.hpp"
+#include "oops/objArrayKlass.hpp"
+#include "oops/typeArrayKlass.hpp"
 #include "runtime/jniHandles.hpp"
 #include "runtime/os.hpp"
 #include "runtime/signature.hpp"
@@ -70,11 +73,14 @@ static int compare_jeandle_scalar_field_desc(JeandleScalarFieldDesc* left,
 class JeandleExplicitScalarField {
 public:
   int _offset;
+  BasicType _type;
   GrowableArray<ScopeValue*>* _values;
 
-  JeandleExplicitScalarField() : _offset(0), _values(nullptr) {}
-  JeandleExplicitScalarField(int offset, GrowableArray<ScopeValue*>* values)
-      : _offset(offset), _values(values) {}
+  JeandleExplicitScalarField()
+      : _offset(0), _type(T_ILLEGAL), _values(nullptr) {}
+  JeandleExplicitScalarField(int offset, BasicType type,
+                             GrowableArray<ScopeValue*>* values)
+      : _offset(offset), _type(type), _values(values) {}
 };
 
 static ObjectValue* find_object_value(GrowableArray<ScopeValue*>* objects, int id) {
@@ -98,13 +104,13 @@ static ObjectValue* get_or_create_object_value(GrowableArray<ScopeValue*>* objec
   return obj;
 }
 
-static GrowableArray<ScopeValue*>* find_explicit_scalar_field(GrowableArray<JeandleExplicitScalarField>* fields,
-                                                              int offset) {
+static JeandleExplicitScalarField* find_explicit_scalar_field(
+    GrowableArray<JeandleExplicitScalarField>* fields, int offset) {
   if (fields == nullptr) return nullptr;
   for (int i = 0; i < fields->length(); i++) {
     JeandleExplicitScalarField* field = fields->adr_at(i);
     if (field->_offset == offset) {
-      return field->_values;
+      return field;
     }
   }
   return nullptr;
@@ -143,6 +149,29 @@ static void append_default_scope_value(BasicType type, GrowableArray<ScopeValue*
       break;
     default:
       ShouldNotReachHere();
+  }
+}
+
+static bool lazy_array_element_encoding_matches(BasicType element_type,
+                                                BasicType encoded_type) {
+  switch (element_type) {
+    case T_BOOLEAN:
+    case T_BYTE:
+    case T_CHAR:
+    case T_SHORT:
+    case T_INT:
+      return encoded_type == T_INT;
+    case T_LONG:
+      return encoded_type == T_LONG;
+    case T_FLOAT:
+      return encoded_type == T_FLOAT;
+    case T_DOUBLE:
+      return encoded_type == T_DOUBLE;
+    case T_OBJECT:
+    case T_ARRAY:
+      return encoded_type == T_OBJECT || encoded_type == T_ARRAY;
+    default:
+      return false;
   }
 }
 
@@ -705,13 +734,18 @@ int JeandleCompiledCode::fill_one_lazy_object(const StackMapParser& stackmaps,
                                                GrowableArray<ScopeValue*>* objects) {
   assert(objects != nullptr, "lazy object pool must exist");
   assert(encode.valueType() == DeoptValueEncoding::LazyObjectType, "should be");
-  assert(static_cast<BasicType>(encode.basicType()) == T_OBJECT, "should be");
+  BasicType object_type = static_cast<BasicType>(encode.basicType());
+  assert(object_type == T_OBJECT || object_type == T_ARRAY, "should be");
+  bool is_array_record = object_type == T_ARRAY;
 
   int consumed = 1; // The LazyObjectType encoding operand itself.
   assert(location != location_end, "missing lazy object klass");
   auto klass_location = *(location++);
   Klass* klass = (Klass*)StackMapUtil::getConstantUlong(stackmaps, klass_location);
   consumed++;
+
+  guarantee(is_array_record == klass->is_array_klass(),
+            "lazy-object kind must agree with klass");
 
   jobject mirror = JNIHandles::make_local(klass->java_mirror());
   ScopeValue* klass_value = new ConstantOopWriteValue(mirror);
@@ -721,6 +755,17 @@ int JeandleCompiledCode::fill_one_lazy_object(const StackMapParser& stackmaps,
     objects->append(obj);
   } else if (obj->klass() == nullptr) {
     obj->set_klass(klass_value);
+  }
+
+  int array_length = -1;
+  if (is_array_record) {
+    assert(location != location_end, "missing lazy array length");
+    auto length_location = *(location++);
+    uint64_t length =
+        StackMapUtil::getConstantUlong(stackmaps, length_location);
+    guarantee(length <= max_jint, "invalid lazy array length");
+    array_length = static_cast<int>(length);
+    consumed++;
   }
 
   assert(location != location_end, "missing lazy object field count");
@@ -747,7 +792,8 @@ int JeandleCompiledCode::fill_one_lazy_object(const StackMapParser& stackmaps,
 
     GrowableArray<ScopeValue*>* values = new GrowableArray<ScopeValue*>(2);
     fill_one_scope_value(stackmaps, field_enc, value_location, values, objects);
-    explicit_fields->append(JeandleExplicitScalarField(offset, values));
+    explicit_fields->append(JeandleExplicitScalarField(
+        offset, static_cast<BasicType>(field_enc.basicType()), values));
     consumed += 3;
   }
 
@@ -755,12 +801,52 @@ int JeandleCompiledCode::fill_one_lazy_object(const StackMapParser& stackmaps,
     return consumed;
   }
 
-  if (!klass->is_instance_klass()) {
-    // Array lazy objects need element-count based reconstruction; PEA only
-    // emits instance LazyObjectType records for now.
-    Unimplemented();
+  if (is_array_record) {
+    BasicType element_type = T_ILLEGAL;
+    if (klass->is_typeArray_klass()) {
+      element_type = TypeArrayKlass::cast(klass)->element_type();
+    } else {
+      guarantee(klass->is_objArray_klass(), "array klass expected");
+      element_type = T_OBJECT;
+    }
+
+    int base_offset = arrayOopDesc::base_offset_in_bytes(element_type);
+    int element_scale = type2aelembytes(element_type);
+    int explicit_index = 0;
+    int next_explicit_element = -1;
+    JeandleExplicitScalarField* next_explicit_field = nullptr;
+    for (int index = 0; index < array_length; index++) {
+      if (next_explicit_field == nullptr &&
+          explicit_index < explicit_fields->length()) {
+        next_explicit_field = explicit_fields->adr_at(explicit_index);
+        int adjusted = next_explicit_field->_offset - base_offset;
+        guarantee(adjusted >= 0 && adjusted % element_scale == 0,
+                  "misaligned lazy array element");
+        next_explicit_element = adjusted / element_scale;
+        guarantee(next_explicit_element < array_length,
+                  "lazy array element is out of bounds");
+        guarantee(next_explicit_element >= index,
+                  "lazy array elements must be unique and ordered");
+        guarantee(lazy_array_element_encoding_matches(
+                      element_type, next_explicit_field->_type),
+                  "lazy array element type mismatch");
+      }
+
+      if (next_explicit_field != nullptr && next_explicit_element == index) {
+        append_scope_values(obj->field_values(),
+                            next_explicit_field->_values);
+        explicit_index++;
+        next_explicit_field = nullptr;
+      } else {
+        append_default_scope_value(element_type, obj->field_values());
+      }
+    }
+    guarantee(explicit_index == explicit_fields->length(),
+              "unconsumed lazy array element");
+    return consumed;
   }
 
+  guarantee(klass->is_instance_klass(), "instance klass expected");
   GrowableArray<JeandleScalarFieldDesc>* fields = new GrowableArray<JeandleScalarFieldDesc>();
   InstanceKlass* ik = InstanceKlass::cast(klass);
   while (ik != nullptr) {
@@ -775,8 +861,9 @@ int JeandleCompiledCode::fill_one_lazy_object(const StackMapParser& stackmaps,
 
   for (int i = 0; i < fields->length(); i++) {
     JeandleScalarFieldDesc* field = fields->adr_at(i);
-    if (GrowableArray<ScopeValue*>* values = find_explicit_scalar_field(explicit_fields, field->_offset)) {
-      append_scope_values(obj->field_values(), values);
+    if (JeandleExplicitScalarField* explicit_field =
+            find_explicit_scalar_field(explicit_fields, field->_offset)) {
+      append_scope_values(obj->field_values(), explicit_field->_values);
     } else {
       append_default_scope_value(field->_type, obj->field_values());
     }
