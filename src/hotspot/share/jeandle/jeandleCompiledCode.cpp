@@ -712,6 +712,7 @@ void JeandleCompiledCode::fill_one_monitor_value(const StackMapParser& stackmaps
 
   bool is_constant = StackMapUtil::is_constant(object);
   ScopeValue* locked_object = nullptr;
+  bool eliminated = false;
   if (is_constant) {
     uint64_t v = StackMapUtil::getConstantUlong(stackmaps, object);
     if (v == 0L) {
@@ -719,12 +720,13 @@ void JeandleCompiledCode::fill_one_monitor_value(const StackMapParser& stackmaps
     } else {
       /* Non-zero object constants in Jeandle deopt info are lazy-object ids. */
       locked_object = get_or_create_object_value(objects, (int)v);
+      eliminated = true;
     }
   } else {
     locked_object = new_location_value(object, Location::oop);
   }
   Location basic_lock = Location::new_stk_loc(Location::normal, StackMapUtil::stack_offset(lock));
-  array->append(new MonitorValue(locked_object, basic_lock, false /* eliminated */));
+  array->append(new MonitorValue(locked_object, basic_lock, eliminated));
 }
 
 int JeandleCompiledCode::fill_one_lazy_object(const StackMapParser& stackmaps,

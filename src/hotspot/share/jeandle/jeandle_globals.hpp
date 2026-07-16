@@ -63,6 +63,12 @@
           "Use interpreter/C1 profile (MDO) for branch/switch weights, "    \
           "unstable-if branch pruning")                                     \
                                                                             \
+  product(bool, JeandleUseEscapeAnalysis, true,                             \
+          "Enable Jeandle partial escape analysis and optimization")        \
+                                                                            \
+  product(bool, JeandleEliminateLocks, true,                                \
+          "Enable lock elimination in Jeandle PEA")                         \
+                                                                            \
   product(intx, JeandleNodeCountInliningCutoff, 18000,                      \
           "If root LLVM IR instruction count exceeds limit stop inlining."  \
           "This value roughly follows C2's cutoff today; tune it later"     \
